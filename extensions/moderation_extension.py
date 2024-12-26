@@ -1,19 +1,23 @@
 import datetime
 from interactions import Button, ButtonStyle, Embed, EmbedField, Extension, Color, OptionType
 import interactions
-from redis import Redis
+from database import RedisDB
 
 class ModerationExtension(Extension):
     def __init__(self, bot):
         self.bot = bot
-        self.warndb = Redis(db=4)
-        self.instancedb = Redis(db=5)
-        self.db_whitelist = Redis(db=1)
+        self.warndb = RedisDB(db=4)
+        self.instancedb = RedisDB(db=5)
+        self.db_whitelist = RedisDB(db=1)
         self.FORCE_OVERRIDE_USER_ID = ["686107711829704725", "708812851229229208", "1259678639159644292", "1168346688969252894"]
         self.WHITELIST_KEY = "warn_whitelist"
         self.TIMEOUT_FIRST_INSTANCE = datetime.timedelta(minutes=5)
         self.TIMEOUT_SECOND_INSTANCE = datetime.timedelta(hours=1)
         self.TIMEOUT_THIRD_INSTANCE = datetime.timedelta(days=1)
+        
+    def _get_warn_reasons_key(self, user_id):
+        """Helper method to get the Redis key for storing warning reasons"""
+        return f"warn_reasons:{user_id}"
 
     async def is_user_whitelisted(self, user_id):
         if str(user_id) in self.FORCE_OVERRIDE_USER_ID:
@@ -27,8 +31,22 @@ class ModerationExtension(Extension):
         return True
 
     @interactions.slash_command(
-        name="warn",
-        description="Warn a user"
+        name="moderation",
+        description="Moderation commands for managing users"
+    )
+    async def moderation(self, ctx):
+        """Base command - shows help text"""
+        help_text = (
+            "Available subcommands:\n"
+            "- /moderation warn - Warn a user\n"
+            "- /moderation warns - Check warnings for a user\n"
+            "- /moderation clearwarns - Clear all warnings for a user"
+        )
+        await ctx.send(help_text)
+
+    @moderation.subcommand(
+        sub_cmd_name="warn",
+        sub_cmd_description="Warn a user"
     )
     @interactions.slash_option(
         name="user",
@@ -48,9 +66,14 @@ class ModerationExtension(Extension):
             return
 
         # Get and update warns/instances
-        warns = int(self.warndb.get(user.id) or 0) + 1
-        self.warndb.set(user.id, warns)
-        instances = int(self.instancedb.get(user.id) or 0)
+        warns = int(self.warndb.get(str(user.id)) or 0) + 1
+        self.warndb.set(str(user.id), warns)
+        instances = int(self.instancedb.get(str(user.id)) or 0)
+        
+        # Store warning reason with timestamp
+        warn_reasons_key = self._get_warn_reasons_key(user.id)
+        timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        self.warndb.rpush(warn_reasons_key, f"{timestamp}: {reason}")
 
         # Calculate timeout info based on instances
         next_timeout = "5 minutes" if instances == 0 else "1 hour" if instances == 1 else "1 day"
@@ -74,7 +97,11 @@ class ModerationExtension(Extension):
 
         try:
             await user.send(embed=dm_embed)
-        except:
+        except discord.errors.Forbidden:
+            # User has DMs disabled
+            pass
+        except discord.errors.HTTPException as e:
+            logger.warning(f"Failed to send DM to user {user.id}: {e}")
             pass
 
         # Handle timeout if user reaches 3 warnings
@@ -83,7 +110,7 @@ class ModerationExtension(Extension):
             instances += 1
             if instances > 3:
                 instances = 1
-            self.instancedb.set(user.id, instances)
+            self.instancedb.set(str(user.id), instances)
 
             # Set timeout duration based on instance
             if instances == 1:
@@ -95,7 +122,7 @@ class ModerationExtension(Extension):
             elif instances == 3:
                 timeout_until = datetime.datetime.now(datetime.timezone.utc) + self.TIMEOUT_THIRD_INSTANCE
                 timeout_str = "1 day"
-                self.instancedb.set(user.id, 0)
+                self.instancedb.set(str(user.id), 0)
 
             # Attempt to timeout the user in the current guild
             timeout_success = False
@@ -136,7 +163,7 @@ class ModerationExtension(Extension):
                 )
 
             # Reset warnings
-            self.warndb.set(user.id, 0)
+            self.warndb.set(str(user.id), 0)
 
             # Send timeout notifications if successful
             if timeout_success:
@@ -175,9 +202,9 @@ class ModerationExtension(Extension):
         warn_embed.set_footer(text="At 3 warnings, the user will be timed out.")
         await ctx.send(embed=warn_embed, ephemeral=True)
     
-    @interactions.slash_command(
-        name="warns",
-        description="Check the number of warns a user has"
+    @moderation.subcommand(
+        sub_cmd_name="warns",
+        sub_cmd_description="Check the number of warns a user has"
     )
     @interactions.slash_option(
         name="user",
@@ -188,8 +215,8 @@ class ModerationExtension(Extension):
     async def warns(self, ctx, user):
         if not await self.check_whitelist(ctx):
             return
-        warns = self.warndb.get(user.id)
-        instances = self.instancedb.get(user.id)
+        warns = self.warndb.get(str(user.id))
+        instances = self.instancedb.get(str(user.id))
         if warns is None: warns = 0
         else: warns = int(warns)
         if instances is None: instances = 0
@@ -198,13 +225,21 @@ class ModerationExtension(Extension):
             title=f"Warning Information for {user.display_name}",
             color=Color.random()
         )
-        warn_embed.add_field(name="Current Warn Count", value=f"{warns}")
-        warn_embed.add_field(name="Total Warning Instances", value=f"{instances}")
+        warn_embed.add_field(name="Current Warn Count", value=f"{warns}", inline=True)
+        warn_embed.add_field(name="Total Warning Instances", value=f"{instances}", inline=True)
+        
+        # Get and display warning reasons if any exist
+        warn_reasons_key = self._get_warn_reasons_key(user.id)
+        reasons = self.warndb.lrange(warn_reasons_key, 0, -1)
+        if reasons:
+            reasons_text = "\n".join(reason.decode('utf-8') for reason in reasons[-warns:])  # Only show active warnings
+            warn_embed.add_field(name="Active Warning Details", value=reasons_text, inline=False)
+        
         await ctx.send(embed=warn_embed, ephemeral=True)
     
-    @interactions.slash_command(
-        name="clearwarns",
-        description="Clear the warns of a user"
+    @moderation.subcommand(
+        sub_cmd_name="clearwarns",
+        sub_cmd_description="Clear the warns of a user"
     )
     @interactions.slash_option(
         name="user",
@@ -215,8 +250,9 @@ class ModerationExtension(Extension):
     async def clearwarns(self, ctx, user):
         if not await self.check_whitelist(ctx):
             return
-        self.warndb.delete(user.id)
-        self.instancedb.delete(user.id)
+        self.warndb.delete(str(user.id))
+        self.instancedb.delete(str(user.id))
+        self.warndb.delete(self._get_warn_reasons_key(user.id))
         clear_embed = Embed(
             title="Warnings Cleared",
             color=Color.random(),
