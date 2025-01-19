@@ -42,5 +42,7 @@ if __name__ == '__main__':
         except interactions.errors.ExtensionLoadException as e:
             logger.error(f"Failed to load extension {extension}.", exc_info=e)
 
-    client.start()
+    client.load_extension("extensions.wall_of_shame_extension")
+    logger.info("Loaded extension extensions.wall_of_shame_extension")
 
+    client.start()
